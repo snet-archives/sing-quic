@@ -7,11 +7,13 @@ import (
 	"errors"
 	"io"
 	"net"
+	"net/http"
 	"runtime"
 	"sync"
 	"time"
 
 	"github.com/sagernet/quic-go"
+	"github.com/sagernet/quic-go/http3"
 	qtls "github.com/sagernet/sing-quic"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/auth"
@@ -37,6 +39,7 @@ type ServiceOptions struct {
 	Heartbeat         time.Duration
 	UDPTimeout        time.Duration
 	Handler           ServiceHandler
+	MasqueradeHandler http.Handler
 }
 
 type ServiceHandler interface {
@@ -56,6 +59,8 @@ type Service[U comparable] struct {
 	authTimeout       time.Duration
 	udpTimeout        time.Duration
 	handler           ServiceHandler
+	masqueradeHandler http.Handler
+	h3Server          *http3.Server
 
 	quicListener io.Closer
 }
@@ -83,6 +88,12 @@ func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
 	default:
 		return nil, E.New("unknown congestion control algorithm: ", options.CongestionControl)
 	}
+	var h3Server *http3.Server
+	if options.MasqueradeHandler != nil {
+		h3Server = &http3.Server{
+			Handler: options.MasqueradeHandler,
+		}
+	}
 	return &Service[U]{
 		ctx:               options.Context,
 		logger:            options.Logger,
@@ -94,6 +105,8 @@ func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
 		authTimeout:       options.AuthTimeout,
 		udpTimeout:        options.UDPTimeout,
 		handler:           options.Handler,
+		masqueradeHandler: options.MasqueradeHandler,
+		h3Server:          h3Server,
 	}, nil
 }
 
@@ -154,12 +167,116 @@ func (s *Service[U]) Start(conn net.PacketConn) error {
 }
 
 func (s *Service[U]) Close() error {
-	return common.Close(
+	err := common.Close(
 		s.quicListener,
 	)
+	if s.h3Server != nil {
+		_ = s.h3Server.Close()
+	}
+	return err
 }
 
 func (s *Service[U]) handleConnection(connection *quic.Conn) {
+	if s.h3Server != nil {
+		s.detectAndServeConnection(connection)
+		return
+	}
+	s.startSession(connection, nil, nil)
+}
+
+func (s *Service[U]) detectAndServeConnection(connection *quic.Conn) {
+	detectCtx, cancelDetect := context.WithTimeout(connection.Context(), s.authTimeout)
+	defer cancelDetect()
+
+	ctxWatcher := context.AfterFunc(s.ctx, cancelDetect)
+	defer ctxWatcher()
+
+	var (
+		mu      sync.Mutex
+		decided bool
+		isHTTP3 bool
+		uniStr  *quic.ReceiveStream
+		bidiStr *quic.Stream
+		wg      sync.WaitGroup
+	)
+	decide := func(h3 bool) {
+		mu.Lock()
+		if !decided {
+			decided = true
+			isHTTP3 = h3
+			if uniStr != nil {
+				_ = uniStr.SetReadDeadline(time.Now())
+			}
+			if bidiStr != nil {
+				_ = bidiStr.SetReadDeadline(time.Now())
+			}
+			cancelDetect()
+		}
+		mu.Unlock()
+	}
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		str, err := connection.AcceptUniStream(detectCtx)
+		if err != nil {
+			return
+		}
+		mu.Lock()
+		uniStr = str
+		alreadyDecided := decided
+		mu.Unlock()
+		if alreadyDecided {
+			return
+		}
+		var first [1]byte
+		n, _ := str.Peek(first[:])
+		if n >= 1 {
+			decide(first[0] != Version)
+		}
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		str, err := connection.AcceptStream(detectCtx)
+		if err != nil {
+			return
+		}
+		mu.Lock()
+		bidiStr = str
+		alreadyDecided := decided
+		mu.Unlock()
+		if alreadyDecided {
+			return
+		}
+		var first [1]byte
+		n, _ := str.Peek(first[:])
+		if n >= 1 {
+			decide(first[0] != Version)
+		}
+	}()
+
+	wg.Wait()
+	if uniStr != nil {
+		_ = uniStr.SetReadDeadline(time.Time{})
+	}
+	if bidiStr != nil {
+		_ = bidiStr.SetReadDeadline(time.Time{})
+	}
+	if !decided {
+		_ = connection.CloseWithError(0, "")
+		return
+	}
+	if isHTTP3 {
+		_ = s.h3Server.ServeQUICConnWithInitial(connection, uniStr, bidiStr)
+		_ = connection.CloseWithError(0, "")
+		return
+	}
+	s.startSession(connection, uniStr, bidiStr)
+}
+
+func (s *Service[U]) startSession(connection *quic.Conn, initialUni *quic.ReceiveStream, initialBidi *quic.Stream) {
 	setCongestion(s.ctx, connection, s.congestionControl)
 	session := &serverSession[U]{
 		Service:    s,
@@ -169,7 +286,7 @@ func (s *Service[U]) handleConnection(connection *quic.Conn) {
 		authDone:   make(chan struct{}),
 		udpConnMap: make(map[uint16]*udpPacketConn),
 	}
-	session.handle()
+	session.handleWithInitial(initialUni, initialBidi)
 }
 
 type serverSession[U comparable] struct {
@@ -187,6 +304,10 @@ type serverSession[U comparable] struct {
 }
 
 func (s *serverSession[U]) handle() {
+	s.handleWithInitial(nil, nil)
+}
+
+func (s *serverSession[U]) handleWithInitial(initialUni *quic.ReceiveStream, initialBidi *quic.Stream) {
 	if s.ctx.Done() != nil {
 		go func() {
 			select {
@@ -196,14 +317,24 @@ func (s *serverSession[U]) handle() {
 			}
 		}()
 	}
-	go s.loopUniStreams()
-	go s.loopStreams()
+	go s.loopUniStreams(initialUni)
+	go s.loopStreams(initialBidi)
 	go s.loopMessages()
 	go s.handleAuthTimeout()
 	go s.loopHeartbeats()
 }
 
-func (s *serverSession[U]) loopUniStreams() {
+func (s *serverSession[U]) loopUniStreams(initialUni *quic.ReceiveStream) {
+	if initialUni != nil {
+		uniStream := initialUni
+		initialUni = nil
+		go func() {
+			err := s.handleUniStream(uniStream)
+			if err != nil {
+				s.closeWithError(E.Cause(err, "handle uni stream"))
+			}
+		}()
+	}
 	for {
 		uniStream, err := s.quicConn.AcceptUniStream(s.ctx)
 		if err != nil {
@@ -315,7 +446,19 @@ func (s *serverSession[U]) handleAuthTimeout() {
 	}
 }
 
-func (s *serverSession[U]) loopStreams() {
+func (s *serverSession[U]) loopStreams(initialBidi *quic.Stream) {
+	if initialBidi != nil {
+		stream := initialBidi
+		initialBidi = nil
+		go func() {
+			err := s.handleStream(stream)
+			if err != nil {
+				stream.CancelRead(0)
+				stream.Close()
+				s.logger.Error(E.Cause(err, "handle stream request"))
+			}
+		}()
+	}
 	for {
 		stream, err := s.quicConn.AcceptStream(s.ctx)
 		if err != nil {
