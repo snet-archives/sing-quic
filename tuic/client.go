@@ -32,6 +32,7 @@ type ClientOptions struct {
 	UDPStream         bool
 	ZeroRTTHandshake  bool
 	Heartbeat         time.Duration
+	ChromeParrot      bool
 }
 
 type Client struct {
@@ -61,6 +62,7 @@ func NewClient(options ClientOptions) (*Client, error) {
 		DisablePathMTUDiscovery: !(runtime.GOOS == "windows" || runtime.GOOS == "linux" || runtime.GOOS == "android" || runtime.GOOS == "darwin"),
 		EnableDatagrams:         true,
 		MaxIncomingUniStreams:   1 << 60,
+		ChromeParrot:            options.ChromeParrot,
 	}
 	qtls.ApplyQUICOptions(quicConfig, options.QUICOptions)
 	switch options.CongestionControl {
@@ -216,7 +218,7 @@ func (c *Client) clientHandshake(conn *quic.Conn) error {
 	}
 	defer authStream.Close()
 	handshakeState := conn.ConnectionState()
-	tuicAuthToken, err := handshakeState.TLS.ExportKeyingMaterial(string(c.uuid[:]), []byte(c.password), 32)
+	tuicAuthToken, err := handshakeState.ExportKeyingMaterial(string(c.uuid[:]), []byte(c.password), 32)
 	if err != nil {
 		return E.Cause(err, "export keying material")
 	}

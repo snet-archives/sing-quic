@@ -163,6 +163,24 @@ func quicConfigWithHandshakeTimeout(quicConfig *quic.Config, handshakeTimeout ti
 	return quicConfig
 }
 
+type quicSTDConfigContextProvider interface {
+	STDConfigForQUICContext(ctx context.Context) (*aTLS.STDConfig, error)
+}
+
+type quicSTDConfigProvider interface {
+	STDConfigForQUIC() (*aTLS.STDConfig, error)
+}
+
+func stdConfigForQUIC(ctx context.Context, config aTLS.Config) (*aTLS.STDConfig, error) {
+	if provider, ok := common.Cast[quicSTDConfigContextProvider](config); ok {
+		return provider.STDConfigForQUICContext(ctx)
+	}
+	if provider, ok := common.Cast[quicSTDConfigProvider](config); ok {
+		return provider.STDConfigForQUIC()
+	}
+	return config.STDConfig()
+}
+
 func Dial(ctx context.Context, conn net.Conn, config aTLS.Config, quicConfig *quic.Config) (*quic.Conn, error) {
 	conn = withSyscallConn(conn)
 	quicConfig = quicConfigWithHandshakeTimeout(quicConfig, config.HandshakeTimeout())
@@ -170,7 +188,7 @@ func Dial(ctx context.Context, conn net.Conn, config aTLS.Config, quicConfig *qu
 		quicConn, err := quicTLSConfig.Dial(ctx, conn, quicConfig)
 		return quicConn, WrapError(err)
 	}
-	tlsConfig, err := config.STDConfig()
+	tlsConfig, err := stdConfigForQUIC(ctx, config)
 	if err != nil {
 		return nil, err
 	}
@@ -185,7 +203,7 @@ func DialEarly(ctx context.Context, conn net.Conn, config aTLS.Config, quicConfi
 		quicConn, err := quicTLSConfig.DialEarly(ctx, conn, quicConfig)
 		return quicConn, WrapError(err)
 	}
-	tlsConfig, err := config.STDConfig()
+	tlsConfig, err := stdConfigForQUIC(ctx, config)
 	if err != nil {
 		return nil, err
 	}
@@ -200,7 +218,7 @@ func CreateTransport(conn net.Conn, quicConnPtr **quic.Conn, config aTLS.Config,
 	if quicTLSConfig, isQUICConfig := config.(Config); isQUICConfig {
 		return quicTLSConfig.CreateTransport(conn, quicConnPtr, quicConfig), nil
 	}
-	tlsConfig, err := config.STDConfig()
+	tlsConfig, err := stdConfigForQUIC(context.Background(), config)
 	if err != nil {
 		return nil, err
 	}
@@ -225,7 +243,7 @@ func CreatePacketTransport(conn net.PacketConn, remoteAddr net.Addr, quicConnPtr
 	if quicTLSConfig, isQUICConfig := config.(Config); isQUICConfig {
 		return quicTLSConfig.CreatePacketTransport(conn, remoteAddr, quicConnPtr, quicConfig), nil
 	}
-	tlsConfig, err := config.STDConfig()
+	tlsConfig, err := stdConfigForQUIC(context.Background(), config)
 	if err != nil {
 		return nil, err
 	}
